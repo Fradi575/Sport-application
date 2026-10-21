@@ -2,30 +2,31 @@ import sys
 import requests
 import geopandas as gpd
 import os
+import pandas as pd
 
 from bokeh.plotting import figure
 from bokeh.models import (
-    ColumnDataSource,
-    HoverTool,
     GeoJSONDataSource,
     Legend,
     LegendItem,
-    FactorRange,
     ColumnDataSource,
     HoverTool,
     CheckboxGroup,
     CustomJS,
     TabPanel,
     Tabs,
-    Wedge
+    Select,
+    Button,
+    Div
 )
-from bokeh.layouts import column
+from bokeh.layouts import column, row
 from bokeh.embed import file_html
 from bokeh.resources import INLINE
 
 from PyQt6.QtCore import QUrl
-from PyQt6.QtWidgets import QApplication, QMainWindow, QTabWidget
+from PyQt6.QtWidgets import QApplication, QMainWindow
 from PyQt6.QtWebEngineWidgets import QWebEngineView
+
 
 
 # Stadionok adatai
@@ -732,7 +733,149 @@ checkbox2.js_on_change(
     )
 )
 
+csv_file = os.path.join(
+    os.path.dirname(os.path.abspath(__file__)),
+    "players.csv"
+)
 
+if not os.path.exists(csv_file):
+    raise FileNotFoundError(
+        f"A CSV fájl nem található: {csv_file}"
+    )
+
+df = pd.read_csv(csv_file, encoding="utf-8-sig")
+
+df["Csapat"] = df["Csapat"].astype("string").str.strip()
+
+jatekos_adatok = df[
+    ["Csapat", "TM_Position", "Gól", "Kezdő", "Csere"]
+].fillna(0).to_dict(orient="records")
+
+csapatok = sorted(
+    df["Csapat"].dropna().unique().tolist()
+)
+
+hazai_select = Select(
+    title="Hazai csapat",
+    value=csapatok[0],
+    options=csapatok,
+    width=300
+)
+
+vendeg_select = Select(
+    title="Vendégcsapat",
+    value=csapatok[1],
+    options=csapatok,
+    width=300
+)
+
+becsles_gomb = Button(
+    label="Gólbecslés kiszámítása",
+    button_type="primary",
+    width=250
+)
+
+eredmeny = Div(
+    text="<h3>Válaszd ki a csapatokat!</h3>",
+    width=600
+)
+
+jatekos_source = ColumnDataSource(data=dict(
+    Csapat=df["Csapat"].fillna("").astype(str).tolist(),
+    TM_Position=df["TM_Position"].fillna("").astype(str).tolist(),
+    Gol=pd.to_numeric(df["Gól"], errors="coerce").fillna(0).tolist(),
+    Kezdo=pd.to_numeric(df["Kezdő"], errors="coerce").fillna(0).tolist(),
+    Csere=pd.to_numeric(df["Csere"], errors="coerce").fillna(0).tolist()
+))
+
+becsles_gomb.js_on_click(CustomJS(args=dict(
+    hazai=hazai_select,
+    vendeg=vendeg_select,
+    eredmeny=eredmeny,
+    source=jatekos_source
+), code="""
+    const hazaiNev = hazai.value;
+    const vendegNev = vendeg.value;
+    const data = source.data;
+
+    if (hazaiNev === vendegNev) {
+        eredmeny.text = "<h3>A két csapat nem lehet ugyanaz!</h3>";
+        return;
+    }
+
+    function golbecsles(csapat, oldal) {
+        let jatekosok = [];
+
+        for (let i = 0; i < data.Csapat.length; i++) {
+            if (
+                data.Csapat[i] === csapat &&
+                !String(data.TM_Position[i] || "")
+                    .toLowerCase().includes("goalkeeper")
+            ) {
+                jatekosok.push(i);
+            }
+        }
+
+        if (jatekosok.length < 15) {
+            return null;
+        }
+
+        const szoveg = hazaiNev + "_" + vendegNev + "_" + oldal;
+        let seed = 0;
+
+        for (let i = 0; i < szoveg.length; i++) {
+            seed = (Math.imul(seed, 31) + szoveg.charCodeAt(i)) >>> 0;
+        }
+
+        function veletlen() {
+            seed = (Math.imul(seed, 1664525) + 1013904223) >>> 0;
+            return seed / 4294967296;
+        }
+
+        for (let i = jatekosok.length - 1; i > 0; i--) {
+            const j = Math.floor(veletlen() * (i + 1));
+            [jatekosok[i], jatekosok[j]] =
+                [jatekosok[j], jatekosok[i]];
+        }
+
+        const kivalasztottak = jatekosok.slice(0, 15);
+        let gol = 0;
+
+        kivalasztottak.forEach((index, i) => {
+            if (i < 10) {
+                if (data.Kezdo[index] > 0) {
+                    gol += data.Gol[index] / data.Kezdo[index];
+                }
+            } else {
+                if (data.Csere[index] > 0) {
+                    gol += data.Gol[index] / data.Csere[index];
+                }
+            }
+        });
+
+        gol = Math.round(gol);
+
+        if (gol > 1) {
+            gol -= 1;
+        }
+
+        return gol;
+    }
+
+    const hazaiGol = golbecsles(hazaiNev, "hazai");
+    const vendegGol = golbecsles(vendegNev, "vendeg");
+
+    if (hazaiGol === null || vendegGol === null) {
+        eredmeny.text =
+            "<h3>Mindkét csapatnál legalább 15 mezőnyjátékos szükséges.</h3>";
+        return;
+    }
+
+    eredmeny.text =
+        "<h2>" + hazaiNev + " – " + vendegNev + "</h2>" +
+        "<h3>" + hazaiNev + ": " + hazaiGol + " várható gól</h3>" +
+        "<h3>" + vendegNev + ": " + vendegGol + " várható gól</h3>";
+"""))
 
 tab1 = TabPanel(
     child=column(map_figure, bar_figure),
@@ -749,7 +892,17 @@ tab3 = TabPanel(
     title="Gólszám-életkor"
 )
 
-tabs = Tabs(tabs=[tab1, tab2, tab3])
+tab4 = TabPanel(
+    child=column(
+        row(hazai_select, vendeg_select),
+        becsles_gomb,
+        eredmeny
+    ),
+    title="Gólbecslés"
+)
+
+
+tabs = Tabs(tabs=[tab1, tab2, tab3, tab4])
 
 html = file_html(tabs, INLINE, "Dashboard")
 
